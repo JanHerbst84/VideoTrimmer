@@ -219,24 +219,45 @@ class VideoProcessor:
                 "ffmpeg", "-y",  # Overwrite output files without asking
                 "-i", self.video_path,
                 "-ss", str(start_seconds),
-                "-t", str(duration),
-                "-c:v", "libx264",  # Use H.264 codec for video
-                "-c:a", "aac"       # Use AAC codec for audio
+                "-t", str(duration)
             ]
             
-            # Add fade effects if needed
-            filter_complex = []
+            # Initialize filter_complex list for both video and audio filters
+            video_filters = []
+            audio_filters = []
             
+            # Add fade effects if needed
             if segment.fade_in_duration > 0:
-                filter_complex.append(f"fade=t=in:st=0:d={segment.fade_in_duration}")
+                # Video fade in
+                video_filters.append(f"fade=t=in:st=0:d={segment.fade_in_duration}")
+                # Audio fade in
+                audio_filters.append(f"afade=t=in:st=0:d={segment.fade_in_duration}")
             
             if segment.fade_out_duration > 0:
+                # Calculate fade out start time
                 fade_out_start = duration - segment.fade_out_duration
-                filter_complex.append(f"fade=t=out:st={fade_out_start}:d={segment.fade_out_duration}")
+                if fade_out_start < 0:
+                    fade_out_start = 0
+                
+                # Video fade out
+                video_filters.append(f"fade=t=out:st={fade_out_start}:d={segment.fade_out_duration}")
+                # Audio fade out
+                audio_filters.append(f"afade=t=out:st={fade_out_start}:d={segment.fade_out_duration}")
             
-            # Apply filter if needed
-            if filter_complex:
-                cmd.extend(["-vf", ",".join(filter_complex)])
+            # Apply video filters if any
+            if video_filters:
+                cmd.extend(["-vf", ",".join(video_filters)])
+            
+            # Apply audio filters if any
+            if audio_filters:
+                cmd.extend(["-af", ",".join(audio_filters)])
+            
+            # Set output codecs
+            cmd.extend([
+                "-c:v", "libx264",  # Use H.264 codec for video
+                "-c:a", "aac",      # Use AAC codec for audio
+                "-b:a", "192k"      # Set audio bitrate for better quality
+            ])
             
             # Add output path
             cmd.append(output_path)
