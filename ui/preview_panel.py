@@ -125,11 +125,8 @@ class PreviewPanel(QWidget):
         self.current_timecode = QLineEdit("00:00:00")
         self.current_timecode.setValidator(QRegExpValidator(QRegExp(r'\d{2}:\d{2}:\d{2}(?:[:.]\d{1,3})?')))
         self.current_timecode.returnPressed.connect(self._seek_to_current_timecode)
+        time_layout.addWidget(QLabel("Current Position:"))
         time_layout.addWidget(self.current_timecode)
-        
-        seek_button = QPushButton("Seek")
-        seek_button.clicked.connect(self._seek_to_current_timecode)
-        time_layout.addWidget(seek_button)
         
         # Add Open in External Player button
         external_player_button = QPushButton("Open in External Player")
