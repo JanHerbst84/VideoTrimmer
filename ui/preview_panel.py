@@ -1,12 +1,13 @@
 """
-Panel for video preview with playback controls
+Panel for video preview with internal playback using OpenCV
 """
 import os
+import cv2
 from typing import Optional
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QLabel, QSlider, QLineEdit, QFormLayout, QStyle,
-    QSizePolicy, QMessageBox
+    QSizePolicy, QMessageBox, QFrame
 )
 from PyQt5.QtCore import Qt, QTimer, QRegExp, QSize
 from PyQt5.QtGui import QPixmap, QImage, QRegExpValidator
@@ -24,65 +25,49 @@ class VideoPreviewWidget(QLabel):
         self.setMinimumSize(320, 240)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet("background-color: black;")
-        
-        # Set placeholder image
-        self.clear()
+        self.setText("No video loaded")
     
-    def set_frame(self, width: int, height: int, frame_data: bytes):
+    def display_frame(self, frame):
         """
-        Set a video frame
+        Display a video frame (OpenCV format)
         
         Args:
-            width: Frame width
-            height: Frame height
-            frame_data: RGB frame data
+            frame: OpenCV frame (numpy array)
         """
+        if frame is None:
+            self.setText("No frame available")
+            return
+            
         try:
-            # Calculate the correct bytes per line (stride)
-            bytes_per_line = width * 3
+            # Convert BGR to RGB
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            image = QImage(frame_data, width, height, bytes_per_line, QImage.Format_RGB888)
-            if image.isNull():
-                print("Failed to create QImage from frame data")
-                self.setText("Failed to display frame")
-                return
+            # Create QImage from frame
+            h, w, ch = rgb_frame.shape
+            bytes_per_line = ch * w
+            img = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
             
-            # Scale down the image for better performance
-            scaled_width = 640
-            scaled_height = int(height * (scaled_width / width))
-            
-            scaled_image = image.scaled(
-                scaled_width, 
-                scaled_height,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-                
-            pixmap = QPixmap.fromImage(scaled_image)
-            if pixmap.isNull():
-                print("Failed to create QPixmap from QImage")
-                self.setText("Failed to display frame")
-                return
-            
-            # Scale pixmap to fit the widget while preserving aspect ratio
+            # Scale pixmap to fit widget while preserving aspect ratio
+            pixmap = QPixmap.fromImage(img)
             scaled_pixmap = pixmap.scaled(
                 self.size(),
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             )
             
+            # Set pixmap and clear text
             self.setPixmap(scaled_pixmap)
+            
         except Exception as e:
-            print(f"Error displaying frame: {str(e)}")
             self.setText(f"Error displaying frame: {str(e)}")
-            return
     
     def clear(self):
         """Clear the display"""
+        self.clear()
         self.setText("No video loaded")
     
     def resizeEvent(self, event):
-        """Handle resize events to scale the pixmap"""
+        """Handle resize events"""
         if self.pixmap() and not self.pixmap().isNull():
             self.setPixmap(self.pixmap().scaled(
                 event.size(),
@@ -102,12 +87,16 @@ class PreviewPanel(QWidget):
         self.current_time = 0.0
         self.video_path = ""
         self.is_playing = False
+        self.duration = 0.0
         
-        # For static frame display
-        self.update_interval = 33  # ~30 fps in milliseconds
-        self.update_timer = QTimer(self)
-        self.update_timer.setInterval(self.update_interval)
-        self.update_timer.timeout.connect(self._update_frame)
+        # OpenCV video capture
+        self.video_capture = None
+        self.fps = 0.0
+        self.total_frames = 0
+        
+        # Timer for video playback
+        self.playback_timer = QTimer(self)
+        self.playback_timer.timeout.connect(self._update_frame)
         
         self._setup_ui()
     
@@ -127,6 +116,10 @@ class PreviewPanel(QWidget):
         self.current_timecode.returnPressed.connect(self._seek_to_current_timecode)
         time_layout.addWidget(QLabel("Current Position:"))
         time_layout.addWidget(self.current_timecode)
+        
+        # Add duration display
+        self.duration_label = QLabel("/ 00:00:00")
+        time_layout.addWidget(self.duration_label)
         
         # Add Open in External Player button
         external_player_button = QPushButton("Open in External Player")
@@ -156,7 +149,6 @@ class PreviewPanel(QWidget):
         # Play/pause button
         self.play_button = QPushButton()
         self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        self.play_button.setToolTip("Open in system media player")
         self.play_button.clicked.connect(self._toggle_play)
         controls_layout.addWidget(self.play_button)
         
@@ -166,10 +158,35 @@ class PreviewPanel(QWidget):
         self.next_frame_button.clicked.connect(self._next_frame)
         controls_layout.addWidget(self.next_frame_button)
         
+        # Playback speed control
+        speed_layout = QHBoxLayout()
+        speed_layout.addWidget(QLabel("Speed:"))
+        
+        self.speed_slider = QSlider(Qt.Horizontal)
+        self.speed_slider.setRange(25, 200)  # 25% to 200% speed
+        self.speed_slider.setValue(100)  # Default 100% speed
+        self.speed_slider.valueChanged.connect(self._set_playback_speed)
+        speed_layout.addWidget(self.speed_slider)
+        
+        self.speed_label = QLabel("100%")
+        speed_layout.addWidget(self.speed_label)
+        
+        # Add speed control to main controls
         controls_layout.addStretch()
+        controls_layout.addLayout(speed_layout)
         
         # Add to main layout
         layout.addLayout(controls_layout)
+        
+        # Add a separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(separator)
+        
+        # Status display
+        self.status_label = QLabel("No video loaded")
+        layout.addWidget(self.status_label)
         
         # Disable controls initially
         self._update_controls_state(False)
@@ -182,16 +199,47 @@ class PreviewPanel(QWidget):
             video_path: Path to the video file
             processor: VideoProcessor instance
         """
+        # Close any existing video
+        if self.video_capture is not None:
+            self.video_capture.release()
+            self.video_capture = None
+        
+        # Store references
         self.video_path = video_path
         self.video_processor = processor
-        self.current_time = 0.0
         
-        # Enable controls
-        self._update_controls_state(True)
-        
-        # Update the UI
-        self._update_timecode_display()
-        self._seek_to_time(0.0)
+        try:
+            # Open the video with OpenCV
+            self.video_capture = cv2.VideoCapture(video_path)
+            
+            if not self.video_capture.isOpened():
+                raise RuntimeError(f"Could not open video: {video_path}")
+            
+            # Get video properties
+            self.fps = self.video_capture.get(cv2.CAP_PROP_FPS)
+            self.total_frames = int(self.video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.duration = self.total_frames / self.fps if self.fps > 0 else 0
+            
+            # Set timer interval based on FPS
+            self._set_playback_speed(self.speed_slider.value())
+            
+            # Update duration display
+            self.duration_label.setText(f"/ {seconds_to_timecode(self.duration)}")
+            
+            # Reset current time
+            self.current_time = 0.0
+            
+            # Update UI
+            self.status_label.setText(f"Loaded: {os.path.basename(video_path)} ({self.fps:.2f} FPS)")
+            self._update_controls_state(True)
+            
+            # Seek to beginning and show first frame
+            self._seek_to_time(0.0)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load video: {str(e)}")
+            self.status_label.setText("Error loading video")
+            return
     
     def _update_controls_state(self, enabled: bool):
         """
@@ -205,47 +253,98 @@ class PreviewPanel(QWidget):
         self.play_button.setEnabled(enabled)
         self.prev_frame_button.setEnabled(enabled)
         self.next_frame_button.setEnabled(enabled)
+        self.speed_slider.setEnabled(enabled)
         
         # Reset play/pause button icon
         self.is_playing = False
         self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        self.update_timer.stop()
+        self.playback_timer.stop()
     
     def _toggle_play(self):
-        """Toggle play/pause state by opening the system's media player"""
-        if not self.video_processor or not self.video_path:
+        """Toggle play/pause state"""
+        if not self.video_capture:
             return
         
-        try:
-            # Use Windows media player to play the file
-            import os
-            import subprocess
-            
-            # Get current time position in milliseconds
-            position_ms = int(self.current_time * 1000)
-            
-            # Open the video in default player
-            # Note: Most media players don't support starting at a specific time via command line
-            # So we'll just open the video at the beginning
-            os.startfile(self.video_path)
-            
-            # Update UI state
-            self.is_playing = False  # We're not controlling playback internally
+        if self.is_playing:
+            # Pause playback
+            self.playback_timer.stop()
+            self.is_playing = False
             self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-            self.update_timer.stop()
+        else:
+            # Start playback
+            if self.current_time >= self.duration:
+                # If at the end, loop back to beginning
+                self._seek_to_time(0.0)
             
-            # Inform the user
-            print(f"Opened video in system player: {self.video_path}")
+            self.playback_timer.start()
+            self.is_playing = True
+            self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+    
+    def _set_playback_speed(self, speed_percent):
+        """
+        Set the playback speed
+        
+        Args:
+            speed_percent: Speed as a percentage (25-200)
+        """
+        if self.fps > 0:
+            # Calculate frame interval in milliseconds
+            base_interval = 1000.0 / self.fps  # ms per frame at 100% speed
+            interval = base_interval * (100.0 / speed_percent)
+            self.playback_timer.setInterval(int(interval))
             
-        except Exception as e:
-            print(f"Error opening system player: {str(e)}")
-            
-            # Show error message to user
-            QMessageBox.warning(
-                self, 
-                "Player Error",
-                f"Could not open the video in the system player. Error: {str(e)}"
-            )
+            # Update speed label
+            self.speed_label.setText(f"{speed_percent}%")
+    
+    def _update_frame(self):
+        """Update the current frame during playback"""
+        if not self.video_capture or not self.is_playing:
+            return
+        
+        # Get current position
+        current_frame = int(self.current_time * self.fps)
+        next_frame = current_frame + 1
+        
+        if next_frame >= self.total_frames:
+            # End of video reached
+            self._toggle_play()  # Stop playback
+            return
+        
+        # Seek to next frame
+        self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, next_frame)
+        ret, frame = self.video_capture.read()
+        
+        if not ret:
+            # Error reading frame
+            self._toggle_play()  # Stop playback
+            return
+        
+        # Update current time
+        self.current_time = next_frame / self.fps
+        
+        # Update UI
+        self._update_ui_for_time(self.current_time)
+        
+        # Display the frame
+        self.preview_widget.display_frame(frame)
+    
+    def _update_ui_for_time(self, seconds):
+        """
+        Update UI elements for a given time
+        
+        Args:
+            seconds: Time in seconds
+        """
+        # Update timecode display
+        if not self.current_timecode.hasFocus():
+            self.current_timecode.setText(seconds_to_timecode(seconds))
+        
+        # Update slider position
+        if self.duration > 0:
+            slider_position = int((seconds / self.duration) * 1000)
+            self.timeline_slider.blockSignals(True)
+            self.timeline_slider.setValue(slider_position)
+            self.timeline_slider.blockSignals(False)
     
     def _open_in_external_player(self):
         """Open the video in the system's default media player"""
@@ -255,45 +354,15 @@ class PreviewPanel(QWidget):
         try:
             import os
             os.startfile(self.video_path)
-            print(f"Opened video in system player: {self.video_path}")
         except Exception as e:
-            print(f"Error opening external player: {str(e)}")
-            
-            # Show error message to user
             QMessageBox.warning(
                 self, 
                 "Player Error",
                 f"Could not open the video in an external player. Error: {str(e)}"
             )
     
-    def _update_frame(self):
-        """Update the current frame during playback"""
-        if not self.video_processor or not self.is_playing:
-            return
-        
-        try:
-            # Advance time
-            self.current_time += self.update_interval / 1000.0
-            
-            # Check if we've reached the end
-            if self.current_time >= self.video_processor.duration:
-                self.current_time = 0.0
-                self._toggle_play()  # Stop playback
-                return
-            
-            # Update display
-            self._update_timecode_display()
-            self._update_timeline_slider()
-            self._show_frame_at_current_time()
-        except Exception as e:
-            print(f"Error updating frame: {str(e)}")
-            self._toggle_play()  # Stop playback on error
-    
     def _seek_to_current_timecode(self):
         """Seek to the timecode in the input field"""
-        if not self.video_processor:
-            return
-        
         timecode = self.current_timecode.text()
         self.seek_to_timecode(timecode)
     
@@ -304,9 +373,6 @@ class PreviewPanel(QWidget):
         Args:
             timecode: Timecode in HH:MM:SS format
         """
-        if not self.video_processor:
-            return
-        
         try:
             seconds = timecode_to_seconds(timecode)
             self._seek_to_time(seconds)
@@ -321,57 +387,43 @@ class PreviewPanel(QWidget):
         Args:
             seconds: Time in seconds
         """
-        if not self.video_processor:
+        if not self.video_capture:
             return
         
         # Clamp to valid range
-        seconds = max(0.0, min(seconds, self.video_processor.duration))
+        seconds = max(0.0, min(seconds, self.duration))
         
-        self.current_time = seconds
-        self._update_timecode_display()
-        self._update_timeline_slider()
-        self._show_frame_at_current_time()
-    
-    def _show_frame_at_current_time(self):
-        """Show the frame at the current time"""
-        if not self.video_processor:
+        # Calculate frame number
+        frame_number = int(seconds * self.fps)
+        
+        # Seek to frame
+        self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        ret, frame = self.video_capture.read()
+        
+        if not ret:
+            self.status_label.setText(f"Error seeking to frame {frame_number}")
             return
         
-        # Convert to timecode
-        timecode = seconds_to_timecode(self.current_time)
+        # Update current time
+        self.current_time = seconds
         
-        # Get the frame
-        frame_data = self.video_processor.get_frame_at_time(timecode)
-        if frame_data:
-            width, height, data = frame_data
-            self.preview_widget.set_frame(width, height, data)
-        else:
-            self.preview_widget.setText(f"Could not get frame at {timecode}")
-            print(f"Failed to get frame at time {timecode}")
+        # Update UI
+        self._update_ui_for_time(seconds)
+        
+        # Display the frame
+        self.preview_widget.display_frame(frame)
     
     def _update_timecode_display(self):
         """Update the timecode display"""
-        if not self.video_processor:
-            return
-        
         timecode = seconds_to_timecode(self.current_time)
         self.current_timecode.setText(timecode)
-    
-    def _update_timeline_slider(self):
-        """Update the timeline slider position"""
-        if not self.video_processor:
-            return
-        
-        # Calculate position (0-1000)
-        position = int((self.current_time / self.video_processor.duration) * 1000)
-        self.timeline_slider.setValue(position)
     
     def _slider_pressed(self):
         """Handle slider press event"""
         # Pause playback while seeking
         was_playing = self.is_playing
         if was_playing:
-            self._toggle_play()
+            self.playback_timer.stop()
         
         # Store the state to resume after release if needed
         self.timeline_slider.setProperty("was_playing", was_playing)
@@ -380,15 +432,16 @@ class PreviewPanel(QWidget):
         """Handle slider release event"""
         # Get the time from the slider position
         position = self.timeline_slider.value()
-        if self.video_processor:
-            self.current_time = (position / 1000.0) * self.video_processor.duration
-            self._update_timecode_display()
-            self._show_frame_at_current_time()
+        if self.duration > 0:
+            seconds = (position / 1000.0) * self.duration
+            self._seek_to_time(seconds)
         
         # Resume playback if it was playing before
         was_playing = self.timeline_slider.property("was_playing")
         if was_playing:
-            self._toggle_play()
+            self.playback_timer.start()
+            self.is_playing = True
+            self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
     
     def _slider_moved(self, position):
         """
@@ -397,17 +450,67 @@ class PreviewPanel(QWidget):
         Args:
             position: New slider position (0-1000)
         """
-        # Update time display during dragging
-        if self.video_processor:
-            time = (position / 1000.0) * self.video_processor.duration
-            self.current_timecode.setText(seconds_to_timecode(time))
+        # Preview the frame at the slider position
+        if self.duration > 0 and self.video_capture:
+            seconds = (position / 1000.0) * self.duration
+            frame_number = int(seconds * self.fps)
+            
+            # Seek to frame for preview
+            self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            ret, frame = self.video_capture.read()
+            
+            if ret:
+                # Display the frame
+                self.preview_widget.display_frame(frame)
+                
+                # Update timecode display (without changing current_time)
+                if not self.current_timecode.hasFocus():
+                    self.current_timecode.setText(seconds_to_timecode(seconds))
     
     def _prev_frame(self):
         """Go to previous frame"""
-        # Move back by 1/30th of a second
-        self._seek_to_time(self.current_time - 1/30.0)
+        if not self.video_capture:
+            return
+        
+        # Calculate current frame and previous frame
+        current_frame = int(self.current_time * self.fps)
+        prev_frame = max(0, current_frame - 1)
+        
+        if prev_frame != current_frame:
+            # Seek to previous frame
+            self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, prev_frame)
+            ret, frame = self.video_capture.read()
+            
+            if ret:
+                # Update current time
+                self.current_time = prev_frame / self.fps
+                
+                # Update UI
+                self._update_ui_for_time(self.current_time)
+                
+                # Display the frame
+                self.preview_widget.display_frame(frame)
     
     def _next_frame(self):
         """Go to next frame"""
-        # Move forward by 1/30th of a second
-        self._seek_to_time(self.current_time + 1/30.0)
+        if not self.video_capture:
+            return
+        
+        # Calculate current frame and next frame
+        current_frame = int(self.current_time * self.fps)
+        next_frame = min(current_frame + 1, self.total_frames - 1)
+        
+        if next_frame != current_frame:
+            # Seek to next frame
+            self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, next_frame)
+            ret, frame = self.video_capture.read()
+            
+            if ret:
+                # Update current time
+                self.current_time = next_frame / self.fps
+                
+                # Update UI
+                self._update_ui_for_time(self.current_time)
+                
+                # Display the frame
+                self.preview_widget.display_frame(frame)
