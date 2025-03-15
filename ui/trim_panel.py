@@ -7,14 +7,161 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QDoubleSpinBox, QComboBox, QScrollArea,
     QGroupBox, QFormLayout, QMessageBox, QFrame, QDialog,
-    QDialogButtonBox, QInputDialog, QListWidget, QStyle
+    QDialogButtonBox, QInputDialog, QListWidget, QStyle,
+    QToolButton, QGridLayout
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QRegExp
-from PyQt5.QtGui import QRegExpValidator
+from PyQt5.QtGui import QRegExpValidator, QIcon
 
 from models.video_segment import VideoSegment
 from utils.config_manager import ConfigManager
-from services.timecode_utils import validate_timecode
+from services.timecode_utils import validate_timecode, timecode_to_seconds, seconds_to_timecode
+
+
+class TimeAdjustWidget(QWidget):
+    """Widget for adjusting timecode with buttons for hours, minutes, and seconds"""
+    
+    # Signal when time is changed
+    time_changed = pyqtSignal(str)
+    
+    def __init__(self, initial_time="00:00:00", parent=None):
+        """
+        Initialize the time adjust widget
+        
+        Args:
+            initial_time: Initial timecode in HH:MM:SS format
+            parent: Parent widget
+        """
+        super().__init__(parent)
+        
+        self.timecode = initial_time
+        self._setup_ui()
+    
+    def _setup_ui(self):
+        """Set up the UI components"""
+        layout = QGridLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        
+        # Time display
+        self.time_edit = QLineEdit(self.timecode)
+        self.time_edit.setValidator(QRegExpValidator(QRegExp(r'\d{2}:\d{2}:\d{2}(?:[:.]\d{1,3})?')))
+        self.time_edit.setPlaceholderText("HH:MM:SS")
+        self.time_edit.textChanged.connect(self._on_time_edited)
+        layout.addWidget(self.time_edit, 1, 0, 1, 6)  # Span across all columns
+        
+        # Labels
+        layout.addWidget(QLabel("H"), 0, 0, 1, 1, Qt.AlignCenter)
+        layout.addWidget(QLabel("M"), 0, 2, 1, 1, Qt.AlignCenter)
+        layout.addWidget(QLabel("S"), 0, 4, 1, 1, Qt.AlignCenter)
+        
+        # Hour buttons
+        hour_up = QToolButton()
+        hour_up.setText("▲")
+        hour_up.setToolTip("Increase hour")
+        hour_up.clicked.connect(lambda: self._adjust_time(3600))
+        layout.addWidget(hour_up, 2, 0)
+        
+        hour_down = QToolButton()
+        hour_down.setText("▼")
+        hour_down.setToolTip("Decrease hour")
+        hour_down.clicked.connect(lambda: self._adjust_time(-3600))
+        layout.addWidget(hour_down, 3, 0)
+        
+        # Minute buttons
+        min_up = QToolButton()
+        min_up.setText("▲")
+        min_up.setToolTip("Increase minute")
+        min_up.clicked.connect(lambda: self._adjust_time(60))
+        layout.addWidget(min_up, 2, 2)
+        
+        min_down = QToolButton()
+        min_down.setText("▼")
+        min_down.setToolTip("Decrease minute")
+        min_down.clicked.connect(lambda: self._adjust_time(-60))
+        layout.addWidget(min_down, 3, 2)
+        
+        # Second buttons
+        sec_up = QToolButton()
+        sec_up.setText("▲")
+        sec_up.setToolTip("Increase second")
+        sec_up.clicked.connect(lambda: self._adjust_time(1))
+        layout.addWidget(sec_up, 2, 4)
+        
+        sec_down = QToolButton()
+        sec_down.setText("▼")
+        sec_down.setToolTip("Decrease second")
+        sec_down.clicked.connect(lambda: self._adjust_time(-1))
+        layout.addWidget(sec_down, 3, 4)
+        
+        # Fine adjustment buttons (0.1 seconds)
+        fine_up = QToolButton()
+        fine_up.setText("▲")
+        fine_up.setToolTip("Increase 0.1 second")
+        fine_up.clicked.connect(lambda: self._adjust_time(0.1))
+        layout.addWidget(fine_up, 2, 5)
+        
+        fine_down = QToolButton()
+        fine_down.setText("▼")
+        fine_down.setToolTip("Decrease 0.1 second")
+        fine_down.clicked.connect(lambda: self._adjust_time(-0.1))
+        layout.addWidget(fine_down, 3, 5)
+        
+        # Add some spacers
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(3, 1)
+    
+    def _on_time_edited(self):
+        """Handle manual time editing"""
+        new_time = self.time_edit.text()
+        if validate_timecode(new_time):
+            self.timecode = new_time
+            self.time_changed.emit(self.timecode)
+    
+    def _adjust_time(self, delta_seconds):
+        """
+        Adjust the time by a specified number of seconds
+        
+        Args:
+            delta_seconds: Amount to adjust in seconds (positive or negative)
+        """
+        try:
+            # Convert current time to seconds
+            seconds = timecode_to_seconds(self.timecode)
+            
+            # Add the delta (ensure we don't go below zero)
+            new_seconds = max(0, seconds + delta_seconds)
+            
+            # Convert back to timecode
+            self.timecode = seconds_to_timecode(new_seconds)
+            
+            # Update display
+            self.time_edit.setText(self.timecode)
+            
+            # Emit signal
+            self.time_changed.emit(self.timecode)
+        except Exception as e:
+            print(f"Error adjusting time: {str(e)}")
+    
+    def set_time(self, timecode):
+        """
+        Set the time to a specific timecode
+        
+        Args:
+            timecode: New timecode in HH:MM:SS format
+        """
+        if validate_timecode(timecode):
+            self.timecode = timecode
+            self.time_edit.setText(timecode)
+    
+    def get_time(self):
+        """
+        Get the current timecode
+        
+        Returns:
+            str: Current timecode in HH:MM:SS format
+        """
+        return self.timecode
 
 
 class SegmentWidget(QGroupBox):
@@ -60,46 +207,39 @@ class SegmentWidget(QGroupBox):
         self.name_edit.textChanged.connect(self._update_segment_name)
         layout.addRow("Name:", self.name_edit)
         
-        # Time range
-        time_layout = QHBoxLayout()
-        
-        # Start time
+        # Start time with adjustment buttons
         start_time_str = str(self.segment.start_time) if hasattr(self.segment, 'start_time') else "00:00:00"
-        self.start_time = QLineEdit(start_time_str)
-        self.start_time.setValidator(QRegExpValidator(QRegExp(r'\d{2}:\d{2}:\d{2}(?:[:.]\d{1,3})?')))
-        self.start_time.setPlaceholderText("HH:MM:SS")
-        self.start_time.textChanged.connect(self._update_segment)
-        time_layout.addWidget(QLabel("Start:"))
-        time_layout.addWidget(self.start_time)
+        self.start_time_widget = TimeAdjustWidget(start_time_str)
+        self.start_time_widget.time_changed.connect(self._update_segment)
+        
+        start_layout = QHBoxLayout()
+        start_layout.addWidget(self.start_time_widget)
         
         # Seek to start button
         seek_start_btn = QPushButton("⏺")
         seek_start_btn.setToolTip("Seek to start time")
         seek_start_btn.setMaximumWidth(30)
-        seek_start_btn.clicked.connect(lambda: self.seek_start_clicked.emit(self.start_time.text()))
-        time_layout.addWidget(seek_start_btn)
+        seek_start_btn.clicked.connect(lambda: self.seek_start_clicked.emit(self.start_time_widget.get_time()))
+        start_layout.addWidget(seek_start_btn)
         
-        layout.addRow("", time_layout)
+        layout.addRow("Start:", start_layout)
         
-        # End time - on a new row for clearer UI
-        end_layout = QHBoxLayout()
-        
+        # End time with adjustment buttons
         end_time_str = str(self.segment.end_time) if hasattr(self.segment, 'end_time') else "00:00:10"
-        self.end_time = QLineEdit(end_time_str)
-        self.end_time.setValidator(QRegExpValidator(QRegExp(r'\d{2}:\d{2}:\d{2}(?:[:.]\d{1,3})?')))
-        self.end_time.setPlaceholderText("HH:MM:SS")
-        self.end_time.textChanged.connect(self._update_segment)
-        end_layout.addWidget(QLabel("End:"))
-        end_layout.addWidget(self.end_time)
+        self.end_time_widget = TimeAdjustWidget(end_time_str)
+        self.end_time_widget.time_changed.connect(self._update_segment)
+        
+        end_layout = QHBoxLayout()
+        end_layout.addWidget(self.end_time_widget)
         
         # Seek to end button
         seek_end_btn = QPushButton("⏺")
         seek_end_btn.setToolTip("Seek to end time")
         seek_end_btn.setMaximumWidth(30)
-        seek_end_btn.clicked.connect(lambda: self.seek_end_clicked.emit(self.end_time.text()))
+        seek_end_btn.clicked.connect(lambda: self.seek_end_clicked.emit(self.end_time_widget.get_time()))
         end_layout.addWidget(seek_end_btn)
         
-        layout.addRow("", end_layout)
+        layout.addRow("End:", end_layout)
         
         # Duration display (calculated)
         self.duration_label = QLabel("0.0 seconds")
@@ -202,10 +342,11 @@ class SegmentWidget(QGroupBox):
     
     def _update_segment(self):
         """Update the segment with current values"""
-        # Validate timecodes
-        start_time = self.start_time.text()
-        end_time = self.end_time.text()
+        # Get timecodes from widgets
+        start_time = self.start_time_widget.get_time()
+        end_time = self.end_time_widget.get_time()
         
+        # Update segment
         if validate_timecode(start_time) and validate_timecode(end_time):
             self.segment.start_time = start_time
             self.segment.end_time = end_time
@@ -236,7 +377,7 @@ class SegmentWidget(QGroupBox):
     
     def _preview_segment(self):
         """Preview this segment by setting the preview to the start time"""
-        self.seek_start_clicked.emit(self.start_time.text())
+        self.seek_start_clicked.emit(self.start_time_widget.get_time())
     
     def get_segment(self) -> VideoSegment:
         """

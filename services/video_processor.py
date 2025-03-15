@@ -214,52 +214,83 @@ class VideoProcessor:
             end_seconds = segment.time_to_seconds(segment.end_time)
             duration = end_seconds - start_seconds
             
-            # Build basic FFmpeg command for trimming
+            # Get fade durations
+            fade_in_sec = segment.fade_in_duration
+            fade_out_sec = segment.fade_out_duration
+            
+            # Completely different approach using filter_complex for better fade control
+            # Basic command structure
             cmd = [
-                "ffmpeg", "-y",  # Overwrite output files without asking
+                "ffmpeg", "-y",
                 "-i", self.video_path,
                 "-ss", str(start_seconds),
                 "-t", str(duration)
             ]
             
-            # Initialize filter_complex list for both video and audio filters
-            video_filters = []
-            audio_filters = []
+            # Instead of using separate video and audio filters,
+            # we'll use a filter_complex to handle both video and audio fades together
+            filter_complex = []
             
-            # Add fade effects if needed
-            if segment.fade_in_duration > 0:
-                # Video fade in
-                video_filters.append(f"fade=t=in:st=0:d={segment.fade_in_duration}")
-                # Audio fade in
-                audio_filters.append(f"afade=t=in:st=0:d={segment.fade_in_duration}")
+            # Start with fade inputs
+            has_fades = False
             
-            if segment.fade_out_duration > 0:
-                # Calculate fade out start time
-                fade_out_start = duration - segment.fade_out_duration
-                if fade_out_start < 0:
-                    fade_out_start = 0
+            # Build the filter_complex string with proper fade timing
+            if fade_in_sec > 0 or fade_out_sec > 0:
+                has_fades = True
+                fade_filters = []
                 
-                # Video fade out
-                video_filters.append(f"fade=t=out:st={fade_out_start}:d={segment.fade_out_duration}")
-                # Audio fade out
-                audio_filters.append(f"afade=t=out:st={fade_out_start}:d={segment.fade_out_duration}")
+                # Add fade in if needed
+                if fade_in_sec > 0:
+                    # For video fade in
+                    fade_filters.append(f"fade=type=in:duration={fade_in_sec}:start_time=0")
+                
+                # Add fade out if needed
+                if fade_out_sec > 0:
+                    # For video fade out, calculate exact start time from the end
+                    fade_out_start = max(0, duration - fade_out_sec)
+                    fade_filters.append(f"fade=type=out:duration={fade_out_sec}:start_time={fade_out_start}")
+                
+                # Combine video fades
+                video_fades = ",".join(fade_filters)
+                
+                # Add video filters
+                filter_complex.append(f"[0:v]setpts=PTS-STARTPTS,{video_fades}[v]")
+                
+                # Now handle audio fades separately for more control
+                audio_filters = []
+                
+                # Add audio fade in if needed
+                if fade_in_sec > 0:
+                    audio_filters.append(f"afade=type=in:duration={fade_in_sec}:start_time=0")
+                
+                # Add audio fade out if needed
+                if fade_out_sec > 0:
+                    fade_out_start = max(0, duration - fade_out_sec)
+                    audio_filters.append(f"afade=type=out:duration={fade_out_sec}:start_time={fade_out_start}")
+                
+                # Combine audio fades
+                audio_fades = ",".join(audio_filters)
+                
+                # Add audio filters
+                filter_complex.append(f"[0:a]asetpts=PTS-STARTPTS,{audio_fades}[a]")
+                
+                # Add the filter_complex to the command
+                cmd.extend(["-filter_complex", ";".join(filter_complex)])
+                
+                # Map the output streams
+                cmd.extend(["-map", "[v]", "-map", "[a]"])
             
-            # Apply video filters if any
-            if video_filters:
-                cmd.extend(["-vf", ",".join(video_filters)])
-            
-            # Apply audio filters if any
-            if audio_filters:
-                cmd.extend(["-af", ",".join(audio_filters)])
-            
-            # Set output codecs
+            # Add output format and quality settings
             cmd.extend([
-                "-c:v", "libx264",  # Use H.264 codec for video
-                "-c:a", "aac",      # Use AAC codec for audio
-                "-b:a", "192k"      # Set audio bitrate for better quality
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "18",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-pix_fmt", "yuv420p"
             ])
             
-            # Add output path
+            # Add output file
             cmd.append(output_path)
             
             # Execute FFmpeg command
@@ -272,14 +303,95 @@ class VideoProcessor:
             
             if result.returncode != 0:
                 print(f"FFmpeg error: {result.stderr}")
-                # Fall back to OpenCV method if FFmpeg fails
+                # Try a simpler approach if the complex approach fails
+                return self._trim_segment_with_ffmpeg_simple(segment, output_path)
+            
+            return output_path
+            
+        except Exception as e:
+            print(f"Error using FFmpeg complex approach: {str(e)}")
+            # Fall back to simpler method
+            return self._trim_segment_with_ffmpeg_simple(segment, output_path)
+    
+    def _trim_segment_with_ffmpeg_simple(self, segment: VideoSegment, output_path: str) -> str:
+        """
+        Simpler approach to trimming with FFmpeg when the complex approach fails
+        
+        Args:
+            segment: VideoSegment object
+            output_path: Output path
+            
+        Returns:
+            str: Output path
+        """
+        try:
+            # Convert timecodes to seconds
+            start_seconds = segment.time_to_seconds(segment.start_time)
+            end_seconds = segment.time_to_seconds(segment.end_time)
+            duration = end_seconds - start_seconds
+            
+            # Simplest approach with separate filters
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", self.video_path,
+                "-ss", str(start_seconds),
+                "-t", str(duration)
+            ]
+            
+            # Add fade effects
+            video_filters = []
+            audio_filters = []
+            
+            # Add fade in effect
+            if segment.fade_in_duration > 0:
+                video_filters.append(f"fade=in:0:{segment.fade_in_duration}")
+                audio_filters.append(f"afade=in:0:{segment.fade_in_duration}")
+            
+            # Add fade out effect
+            if segment.fade_out_duration > 0:
+                # Calculate fade out start time
+                fade_out_start = duration - segment.fade_out_duration
+                if fade_out_start < 0:
+                    fade_out_start = 0
+                
+                video_filters.append(f"fade=out:{fade_out_start}:{segment.fade_out_duration}")
+                audio_filters.append(f"afade=out:{fade_out_start}:{segment.fade_out_duration}")
+            
+            # Apply filters
+            if video_filters:
+                cmd.extend(["-vf", ",".join(video_filters)])
+            
+            if audio_filters:
+                cmd.extend(["-af", ",".join(audio_filters)])
+            
+            # Add quality settings
+            cmd.extend([
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "18",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-pix_fmt", "yuv420p",
+                output_path
+            ])
+            
+            print(f"Running simple FFmpeg command: {' '.join(cmd)}")
+            result = subprocess.run(cmd, 
+                                  stdout=subprocess.PIPE, 
+                                  stderr=subprocess.PIPE,
+                                  text=True,
+                                  check=False)
+            
+            if result.returncode != 0:
+                print(f"Simple FFmpeg approach failed: {result.stderr}")
+                # Fall back to OpenCV
                 return self.trim_segment(segment, output_path)
             
             return output_path
             
         except Exception as e:
-            print(f"Error using FFmpeg, falling back to OpenCV: {str(e)}")
-            # Fall back to OpenCV method
+            print(f"Error using simple FFmpeg approach: {str(e)}")
+            # Last resort, use OpenCV
             return self.trim_segment(segment, output_path)
     
     def _concatenate_videos(self, input_files: List[str], output_file: str):
@@ -310,15 +422,26 @@ class VideoProcessor:
                 ffmpeg_available = False
             
             if ffmpeg_available:
-                # Use ffmpeg to concatenate videos
-                cmd = f'ffmpeg -f concat -safe 0 -i "{list_file}" -c copy "{output_file}"'
-                print(f"Running command: {cmd}")
+                # Use ffmpeg to concatenate videos with better quality settings
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-f', 'concat',
+                    '-safe', '0',
+                    '-i', list_file,
+                    '-c:v', 'libx264',     # Use H.264 codec
+                    '-preset', 'medium',   # Balanced quality and speed
+                    '-crf', '18',          # Higher quality (lower = better)
+                    '-c:a', 'aac',         # AAC audio codec
+                    '-b:a', '192k',        # Audio bitrate
+                    '-pix_fmt', 'yuv420p', # Compatible pixel format
+                    output_file
+                ]
+                print(f"Running command: {' '.join(cmd)}")
                 result = subprocess.run(cmd, 
-                                       shell=True,
-                                       stdout=subprocess.PIPE, 
-                                       stderr=subprocess.PIPE,
-                                       text=True,
-                                       check=False)
+                                      stdout=subprocess.PIPE, 
+                                      stderr=subprocess.PIPE,
+                                      text=True,
+                                      check=False)
                 
                 if result.returncode != 0:
                     print(f"FFmpeg error: {result.stderr}")
