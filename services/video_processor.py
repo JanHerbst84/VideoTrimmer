@@ -4,6 +4,7 @@ Video processing service for trimming videos with fades using OpenCV
 import os
 import numpy as np
 import cv2
+import subprocess
 from typing import List, Optional, Tuple
 from models.video_segment import VideoSegment
 from services.timecode_utils import timecode_to_seconds
@@ -26,6 +27,8 @@ class VideoProcessor:
         self.width = 0
         self.height = 0
         self.total_frames = 0
+        self._frame_cache = {}  # Cache for frequently accessed frames
+        self._cache_size_limit = 30  # Maximum number of frames to cache
         self._load_video()
     
     def _load_video(self):
@@ -165,7 +168,9 @@ class VideoProcessor:
             # Process each segment to its own file
             for i, segment in enumerate(segments):
                 temp_output = os.path.join(temp_dir, f"segment_{i}.mp4")
-                self.trim_segment(segment, temp_output)
+                
+                # Use FFmpeg directly for trimming with audio
+                self._trim_segment_with_ffmpeg(segment, temp_output)
                 segment_files.append(temp_output)
             
             # If only one segment, just rename the file
@@ -191,6 +196,70 @@ class VideoProcessor:
                 os.rmdir(temp_dir)
             except:
                 pass
+
+    def _trim_segment_with_ffmpeg(self, segment: VideoSegment, output_path: str) -> str:
+        """
+        Trim a segment using FFmpeg to preserve audio
+        
+        Args:
+            segment: VideoSegment object containing trim and fade information
+            output_path: Path to save the output video
+            
+        Returns:
+            str: Path to the output file
+        """
+        try:
+            # Convert timecodes to seconds
+            start_seconds = segment.time_to_seconds(segment.start_time)
+            end_seconds = segment.time_to_seconds(segment.end_time)
+            duration = end_seconds - start_seconds
+            
+            # Build basic FFmpeg command for trimming
+            cmd = [
+                "ffmpeg", "-y",  # Overwrite output files without asking
+                "-i", self.video_path,
+                "-ss", str(start_seconds),
+                "-t", str(duration),
+                "-c:v", "libx264",  # Use H.264 codec for video
+                "-c:a", "aac"       # Use AAC codec for audio
+            ]
+            
+            # Add fade effects if needed
+            filter_complex = []
+            
+            if segment.fade_in_duration > 0:
+                filter_complex.append(f"fade=t=in:st=0:d={segment.fade_in_duration}")
+            
+            if segment.fade_out_duration > 0:
+                fade_out_start = duration - segment.fade_out_duration
+                filter_complex.append(f"fade=t=out:st={fade_out_start}:d={segment.fade_out_duration}")
+            
+            # Apply filter if needed
+            if filter_complex:
+                cmd.extend(["-vf", ",".join(filter_complex)])
+            
+            # Add output path
+            cmd.append(output_path)
+            
+            # Execute FFmpeg command
+            print(f"Running FFmpeg command: {' '.join(cmd)}")
+            result = subprocess.run(cmd, 
+                                  stdout=subprocess.PIPE, 
+                                  stderr=subprocess.PIPE,
+                                  text=True,
+                                  check=False)
+            
+            if result.returncode != 0:
+                print(f"FFmpeg error: {result.stderr}")
+                # Fall back to OpenCV method if FFmpeg fails
+                return self.trim_segment(segment, output_path)
+            
+            return output_path
+            
+        except Exception as e:
+            print(f"Error using FFmpeg, falling back to OpenCV: {str(e)}")
+            # Fall back to OpenCV method
+            return self.trim_segment(segment, output_path)
     
     def _concatenate_videos(self, input_files: List[str], output_file: str):
         """
@@ -209,7 +278,6 @@ class VideoProcessor:
         
         try:
             # Check if FFmpeg is available
-            import subprocess
             try:
                 result = subprocess.run(['ffmpeg', '-version'], 
                                        stdout=subprocess.PIPE, 
@@ -306,15 +374,24 @@ class VideoProcessor:
             if seconds < 0 or seconds > self.duration:
                 return None
             
-            # Re-open the video capture to avoid issues with seeking
-            try:
-                self._video_capture.release()
-                self._video_capture = cv2.VideoCapture(self.video_path)
-            except Exception:
-                # If reopening fails, try to continue with the existing capture
-                pass
+            # Check if frame is in cache
+            frame_number = self._get_frame_number(seconds)
+            if frame_number in self._frame_cache:
+                return self._frame_cache[frame_number]
             
-            # Seek by milliseconds rather than frame number for more accuracy
+            # Only reopen for significant jumps to reduce overhead
+            current_pos = self._video_capture.get(cv2.CAP_PROP_POS_MSEC)
+            time_diff_ms = abs(seconds * 1000 - current_pos)
+            
+            if time_diff_ms > 1000:  # If jump is more than 1 second
+                try:
+                    self._video_capture.release()
+                    self._video_capture = cv2.VideoCapture(self.video_path)
+                except Exception:
+                    # If reopening fails, try to continue with the existing capture
+                    pass
+            
+            # Seek by milliseconds for more accuracy
             position_ms = int(seconds * 1000)
             self._video_capture.set(cv2.CAP_PROP_POS_MSEC, position_ms)
             
@@ -328,7 +405,6 @@ class VideoProcessor:
                 ret, frame = self._video_capture.read()
                 
                 if not ret:
-                    print(f"Failed to get frame at time {timecode}")
                     return None
             
             # Convert BGR to RGB
@@ -337,11 +413,25 @@ class VideoProcessor:
             # Convert to bytes
             frame_bytes = rgb_frame.tobytes()
             
-            return (self.width, self.height, frame_bytes)
+            # Cache the frame
+            result = (self.width, self.height, frame_bytes)
+            self._add_to_cache(frame_number, result)
+            
+            return result
             
         except Exception as e:
             print(f"Error getting frame: {str(e)}")
             return None
+    
+    def _add_to_cache(self, frame_number: int, frame_data: Tuple[int, int, bytes]):
+        """Add a frame to the cache, removing oldest if necessary"""
+        # Remove oldest frame if cache is full
+        if len(self._frame_cache) >= self._cache_size_limit:
+            oldest_key = min(self._frame_cache.keys())
+            del self._frame_cache[oldest_key]
+        
+        # Add new frame to cache
+        self._frame_cache[frame_number] = frame_data
     
     def close(self):
         """Release video resources"""

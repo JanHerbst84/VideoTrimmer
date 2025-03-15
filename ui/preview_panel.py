@@ -6,7 +6,7 @@ from typing import Optional
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QLabel, QSlider, QLineEdit, QFormLayout, QStyle,
-    QSizePolicy
+    QSizePolicy, QMessageBox
 )
 from PyQt5.QtCore import Qt, QTimer, QRegExp, QSize
 from PyQt5.QtGui import QPixmap, QImage, QRegExpValidator
@@ -46,8 +46,19 @@ class VideoPreviewWidget(QLabel):
                 print("Failed to create QImage from frame data")
                 self.setText("Failed to display frame")
                 return
+            
+            # Scale down the image for better performance
+            scaled_width = 640
+            scaled_height = int(height * (scaled_width / width))
+            
+            scaled_image = image.scaled(
+                scaled_width, 
+                scaled_height,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
                 
-            pixmap = QPixmap.fromImage(image)
+            pixmap = QPixmap.fromImage(scaled_image)
             if pixmap.isNull():
                 print("Failed to create QPixmap from QImage")
                 self.setText("Failed to display frame")
@@ -91,8 +102,11 @@ class PreviewPanel(QWidget):
         self.current_time = 0.0
         self.video_path = ""
         self.is_playing = False
+        
+        # For static frame display
+        self.update_interval = 33  # ~30 fps in milliseconds
         self.update_timer = QTimer(self)
-        self.update_timer.setInterval(33)  # ~30 fps
+        self.update_timer.setInterval(self.update_interval)
         self.update_timer.timeout.connect(self._update_frame)
         
         self._setup_ui()
@@ -109,13 +123,18 @@ class PreviewPanel(QWidget):
         time_layout = QHBoxLayout()
         
         self.current_timecode = QLineEdit("00:00:00")
-        self.current_timecode.setValidator(QRegExpValidator(QRegExp(r'\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?')))
+        self.current_timecode.setValidator(QRegExpValidator(QRegExp(r'\d{2}:\d{2}:\d{2}(?:[:.]\d{1,3})?')))
         self.current_timecode.returnPressed.connect(self._seek_to_current_timecode)
         time_layout.addWidget(self.current_timecode)
         
         seek_button = QPushButton("Seek")
         seek_button.clicked.connect(self._seek_to_current_timecode)
         time_layout.addWidget(seek_button)
+        
+        # Add Open in External Player button
+        external_player_button = QPushButton("Open in External Player")
+        external_player_button.clicked.connect(self._open_in_external_player)
+        time_layout.addWidget(external_player_button)
         
         layout.addLayout(time_layout)
         
@@ -140,6 +159,7 @@ class PreviewPanel(QWidget):
         # Play/pause button
         self.play_button = QPushButton()
         self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.play_button.setToolTip("Open in system media player")
         self.play_button.clicked.connect(self._toggle_play)
         controls_layout.addWidget(self.play_button)
         
@@ -195,18 +215,59 @@ class PreviewPanel(QWidget):
         self.update_timer.stop()
     
     def _toggle_play(self):
-        """Toggle play/pause state"""
-        if not self.video_processor:
+        """Toggle play/pause state by opening the system's media player"""
+        if not self.video_processor or not self.video_path:
             return
         
-        self.is_playing = not self.is_playing
-        
-        if self.is_playing:
-            self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
-            self.update_timer.start()
-        else:
+        try:
+            # Use Windows media player to play the file
+            import os
+            import subprocess
+            
+            # Get current time position in milliseconds
+            position_ms = int(self.current_time * 1000)
+            
+            # Open the video in default player
+            # Note: Most media players don't support starting at a specific time via command line
+            # So we'll just open the video at the beginning
+            os.startfile(self.video_path)
+            
+            # Update UI state
+            self.is_playing = False  # We're not controlling playback internally
             self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
             self.update_timer.stop()
+            
+            # Inform the user
+            print(f"Opened video in system player: {self.video_path}")
+            
+        except Exception as e:
+            print(f"Error opening system player: {str(e)}")
+            
+            # Show error message to user
+            QMessageBox.warning(
+                self, 
+                "Player Error",
+                f"Could not open the video in the system player. Error: {str(e)}"
+            )
+    
+    def _open_in_external_player(self):
+        """Open the video in the system's default media player"""
+        if not self.video_path:
+            return
+        
+        try:
+            import os
+            os.startfile(self.video_path)
+            print(f"Opened video in system player: {self.video_path}")
+        except Exception as e:
+            print(f"Error opening external player: {str(e)}")
+            
+            # Show error message to user
+            QMessageBox.warning(
+                self, 
+                "Player Error",
+                f"Could not open the video in an external player. Error: {str(e)}"
+            )
     
     def _update_frame(self):
         """Update the current frame during playback"""
@@ -215,7 +276,7 @@ class PreviewPanel(QWidget):
         
         try:
             # Advance time
-            self.current_time += self.update_timer.interval() / 1000.0
+            self.current_time += self.update_interval / 1000.0
             
             # Check if we've reached the end
             if self.current_time >= self.video_processor.duration:

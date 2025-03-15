@@ -6,7 +6,8 @@ from typing import Dict, List, Optional
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QDoubleSpinBox, QComboBox, QScrollArea,
-    QGroupBox, QFormLayout, QMessageBox, QFrame
+    QGroupBox, QFormLayout, QMessageBox, QFrame, QDialog,
+    QDialogButtonBox, QInputDialog, QListWidget, QStyle
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QRegExp
 from PyQt5.QtGui import QRegExpValidator
@@ -52,15 +53,23 @@ class SegmentWidget(QGroupBox):
         """Set up the UI components"""
         layout = QFormLayout(self)
         
+        # Segment name
+        name_str = self.segment.name if hasattr(self.segment, 'name') and self.segment.name else ""
+        self.name_edit = QLineEdit(name_str)
+        self.name_edit.setPlaceholderText("Segment name (optional)")
+        self.name_edit.textChanged.connect(self._update_segment_name)
+        layout.addRow("Name:", self.name_edit)
+        
         # Time range
         time_layout = QHBoxLayout()
         
         # Start time
         start_time_str = str(self.segment.start_time) if hasattr(self.segment, 'start_time') else "00:00:00"
         self.start_time = QLineEdit(start_time_str)
-        self.start_time.setValidator(QRegExpValidator(QRegExp(r'\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?')))
+        self.start_time.setValidator(QRegExpValidator(QRegExp(r'\d{2}:\d{2}:\d{2}(?:[:.]\d{1,3})?')))
         self.start_time.setPlaceholderText("HH:MM:SS")
         self.start_time.textChanged.connect(self._update_segment)
+        time_layout.addWidget(QLabel("Start:"))
         time_layout.addWidget(self.start_time)
         
         # Seek to start button
@@ -70,25 +79,38 @@ class SegmentWidget(QGroupBox):
         seek_start_btn.clicked.connect(lambda: self.seek_start_clicked.emit(self.start_time.text()))
         time_layout.addWidget(seek_start_btn)
         
-        # Separator
-        time_layout.addWidget(QLabel("to"))
+        layout.addRow("", time_layout)
         
-        # End time
+        # End time - on a new row for clearer UI
+        end_layout = QHBoxLayout()
+        
         end_time_str = str(self.segment.end_time) if hasattr(self.segment, 'end_time') else "00:00:10"
         self.end_time = QLineEdit(end_time_str)
-        self.end_time.setValidator(QRegExpValidator(QRegExp(r'\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?')))
+        self.end_time.setValidator(QRegExpValidator(QRegExp(r'\d{2}:\d{2}:\d{2}(?:[:.]\d{1,3})?')))
         self.end_time.setPlaceholderText("HH:MM:SS")
         self.end_time.textChanged.connect(self._update_segment)
-        time_layout.addWidget(self.end_time)
+        end_layout.addWidget(QLabel("End:"))
+        end_layout.addWidget(self.end_time)
         
         # Seek to end button
         seek_end_btn = QPushButton("⏺")
         seek_end_btn.setToolTip("Seek to end time")
         seek_end_btn.setMaximumWidth(30)
         seek_end_btn.clicked.connect(lambda: self.seek_end_clicked.emit(self.end_time.text()))
-        time_layout.addWidget(seek_end_btn)
+        end_layout.addWidget(seek_end_btn)
         
-        layout.addRow("Time Range:", time_layout)
+        layout.addRow("", end_layout)
+        
+        # Duration display (calculated)
+        self.duration_label = QLabel("0.0 seconds")
+        layout.addRow("Duration:", self.duration_label)
+        self._update_duration_display()
+        
+        # Add a separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        layout.addRow(separator)
         
         # Fade presets
         self.preset_combo = QComboBox()
@@ -129,20 +151,24 @@ class SegmentWidget(QGroupBox):
         
         layout.addRow("Fade Durations:", fade_layout)
         
-        # Segment name
-        name_str = self.segment.name if hasattr(self.segment, 'name') and self.segment.name else ""
-        self.name_edit = QLineEdit(name_str)
-        self.name_edit.setPlaceholderText("Segment name (optional)")
-        self.name_edit.textChanged.connect(self._update_segment_name)
-        layout.addRow("Name:", self.name_edit)
+        # Add a separator
+        separator2 = QFrame()
+        separator2.setFrameShape(QFrame.HLine)
+        separator2.setFrameShadow(QFrame.Sunken)
+        layout.addRow(separator2)
         
         # Bottom buttons
         buttons_layout = QHBoxLayout()
         
         # Remove button
-        remove_button = QPushButton("Remove")
+        remove_button = QPushButton("Remove Segment")
         remove_button.clicked.connect(lambda: self.remove_clicked.emit(self))
         buttons_layout.addWidget(remove_button)
+        
+        # Preview button
+        preview_button = QPushButton("Preview Segment")
+        preview_button.clicked.connect(self._preview_segment)
+        buttons_layout.addWidget(preview_button)
         
         layout.addRow("", buttons_layout)
     
@@ -152,12 +178,15 @@ class SegmentWidget(QGroupBox):
         self.preset_combo.addItem("Custom")
         
         for preset in self.presets:
-            self.preset_combo.addItem(preset["name"])
+            name = preset.get("name", "Unknown")
+            fade_in = preset.get("in", 0.0)
+            fade_out = preset.get("out", 0.0)
+            self.preset_combo.addItem(f"{name} (In: {fade_in}s, Out: {fade_out}s)")
             
             # Select if matches current fade settings
-            if (preset["in"] == self.segment.fade_in_duration and 
-                preset["out"] == self.segment.fade_out_duration):
-                self.preset_combo.setCurrentText(preset["name"])
+            if (preset.get("in") == self.segment.fade_in_duration and 
+                preset.get("out") == self.segment.fade_out_duration):
+                self.preset_combo.setCurrentText(f"{name} (In: {fade_in}s, Out: {fade_out}s)")
     
     def _on_preset_changed(self, index):
         """Handle preset selection change"""
@@ -166,8 +195,10 @@ class SegmentWidget(QGroupBox):
         
         preset = self.presets[index - 1]  # -1 because "Custom" is at index 0
         
-        self.fade_in.setValue(preset["in"])
-        self.fade_out.setValue(preset["out"])
+        self.fade_in.setValue(preset.get("in", 0.0))
+        self.fade_out.setValue(preset.get("out", 0.0))
+        
+        self._update_segment()
     
     def _update_segment(self):
         """Update the segment with current values"""
@@ -182,6 +213,17 @@ class SegmentWidget(QGroupBox):
         # Update fade durations
         self.segment.fade_in_duration = self.fade_in.value()
         self.segment.fade_out_duration = self.fade_out.value()
+        
+        # Update duration display
+        self._update_duration_display()
+    
+    def _update_duration_display(self):
+        """Update the duration display label"""
+        try:
+            duration = self.segment.duration
+            self.duration_label.setText(f"{duration:.1f} seconds")
+        except Exception:
+            self.duration_label.setText("Invalid duration")
     
     def _update_segment_name(self):
         """Update the segment name"""
@@ -191,6 +233,10 @@ class SegmentWidget(QGroupBox):
         # Update the group box title
         title = name if name else "Segment"
         self.setTitle(title)
+    
+    def _preview_segment(self):
+        """Preview this segment by setting the preview to the start time"""
+        self.seek_start_clicked.emit(self.start_time.text())
     
     def get_segment(self) -> VideoSegment:
         """
@@ -224,6 +270,9 @@ class TrimPanel(QWidget):
         self.segment_widgets: List[SegmentWidget] = []
         self.enabled = True
         
+        # Load fade presets
+        self.fade_presets = self.config_manager.get_preset_fades()
+        
         self._setup_ui()
     
     def _setup_ui(self):
@@ -233,16 +282,36 @@ class TrimPanel(QWidget):
         # Panel title
         title_label = QLabel("Trim Segments")
         title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("font-weight: bold; font-size: 14px;")
         layout.addWidget(title_label)
         
-        # Buttons at the top
-        buttons_layout = QHBoxLayout()
+        # Top controls
+        top_controls = QHBoxLayout()
         
+        # Add Segment button
         self.add_button = QPushButton("Add Segment")
+        self.add_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder))
         self.add_button.clicked.connect(self.add_segment)
-        buttons_layout.addWidget(self.add_button)
+        top_controls.addWidget(self.add_button)
         
-        layout.addLayout(buttons_layout)
+        # Fade presets management
+        preset_button = QPushButton("Manage Fade Presets")
+        preset_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        preset_button.clicked.connect(self._manage_presets)
+        top_controls.addWidget(preset_button)
+        
+        layout.addLayout(top_controls)
+        
+        # Separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(separator)
+        
+        # Instructions
+        instructions = QLabel("Add trim segments by clicking 'Add Segment'. Set start and end times, and add fade effects as needed.")
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
         
         # Scroll area for segments
         scroll_area = QScrollArea()
@@ -252,6 +321,7 @@ class TrimPanel(QWidget):
         self.segments_container = QWidget()
         self.segments_layout = QVBoxLayout(self.segments_container)
         self.segments_layout.setAlignment(Qt.AlignTop)
+        self.segments_layout.setSpacing(10)
         
         scroll_area.setWidget(self.segments_container)
         layout.addWidget(scroll_area, 1)  # Give the scroll area all available space
@@ -298,16 +368,17 @@ class TrimPanel(QWidget):
             fade_out = 0.5
         
         # Create a new segment
+        segment_count = len(self.segment_widgets) + 1
         segment = VideoSegment(
             start_time=start_time,
             end_time=end_time,
             fade_in_duration=fade_in,
-            fade_out_duration=fade_out
+            fade_out_duration=fade_out,
+            name=f"Segment {segment_count}"
         )
         
         # Create and add the widget
-        presets = self.config_manager.get_preset_fades()
-        widget = SegmentWidget(segment, presets)
+        widget = SegmentWidget(segment, self.fade_presets)
         widget.remove_clicked.connect(self._remove_segment)
         widget.seek_start_clicked.connect(self.segment_seek_requested)
         widget.seek_end_clicked.connect(self.segment_seek_requested)
@@ -344,3 +415,206 @@ class TrimPanel(QWidget):
         
         # Emit the signal
         self.segment_removed.emit(index)
+    
+    def _manage_presets(self):
+        """Open dialog to manage fade presets"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manage Fade Presets")
+        dialog.setMinimumWidth(400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Instructions
+        instructions = QLabel("Manage fade presets to quickly apply common fade effects to your segments.")
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        
+        # List of presets
+        preset_list = QListWidget()
+        for preset in self.fade_presets:
+            preset_list.addItem(f"{preset.get('name')} (In: {preset.get('in', 0)}s, Out: {preset.get('out', 0)}s)")
+        
+        layout.addWidget(preset_list)
+        
+        # Buttons for managing presets
+        buttons_layout = QHBoxLayout()
+        
+        add_button = QPushButton("Add")
+        add_button.clicked.connect(lambda: self._add_preset(preset_list))
+        buttons_layout.addWidget(add_button)
+        
+        edit_button = QPushButton("Edit")
+        edit_button.clicked.connect(lambda: self._edit_preset(preset_list))
+        buttons_layout.addWidget(edit_button)
+        
+        remove_button = QPushButton("Remove")
+        remove_button.clicked.connect(lambda: self._remove_preset(preset_list))
+        buttons_layout.addWidget(remove_button)
+        
+        layout.addLayout(buttons_layout)
+        
+        # Dialog buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok)
+        button_box.accepted.connect(dialog.accept)
+        layout.addWidget(button_box)
+        
+        # Show dialog
+        dialog.exec_()
+        
+        # Update all segment widgets with new presets
+        for widget in self.segment_widgets:
+            widget.presets = self.fade_presets
+            widget._populate_presets()
+    
+    def _add_preset(self, preset_list):
+        """Add a new fade preset"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add Fade Preset")
+        
+        layout = QVBoxLayout(dialog)
+        form_layout = QFormLayout()
+        
+        # Name input
+        name_edit = QLineEdit()
+        form_layout.addRow("Name:", name_edit)
+        
+        # Fade in duration
+        fade_in_edit = QDoubleSpinBox()
+        fade_in_edit.setRange(0, 10)
+        fade_in_edit.setSingleStep(0.1)
+        fade_in_edit.setValue(0.5)
+        fade_in_edit.setSuffix(" sec")
+        form_layout.addRow("Fade In:", fade_in_edit)
+        
+        # Fade out duration
+        fade_out_edit = QDoubleSpinBox()
+        fade_out_edit.setRange(0, 10)
+        fade_out_edit.setSingleStep(0.1)
+        fade_out_edit.setValue(0.5)
+        fade_out_edit.setSuffix(" sec")
+        form_layout.addRow("Fade Out:", fade_out_edit)
+        
+        layout.addLayout(form_layout)
+        
+        # Dialog buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        # Show dialog
+        if dialog.exec_() == QDialog.Accepted:
+            name = name_edit.text()
+            fade_in = fade_in_edit.value()
+            fade_out = fade_out_edit.value()
+            
+            if name:
+                # Add preset
+                new_preset = {
+                    "name": name,
+                    "in": fade_in,
+                    "out": fade_out
+                }
+                
+                self.fade_presets.append(new_preset)
+                preset_list.addItem(f"{name} (In: {fade_in}s, Out: {fade_out}s)")
+                
+                # Save to config
+                self.config_manager.set("preset_fades", self.fade_presets)
+    
+    def _edit_preset(self, preset_list):
+        """Edit a fade preset"""
+        selected_index = preset_list.currentRow()
+        
+        if selected_index == -1 or selected_index >= len(self.fade_presets):
+            return
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Fade Preset")
+        
+        layout = QVBoxLayout(dialog)
+        form_layout = QFormLayout()
+        
+        # Get current preset
+        preset = self.fade_presets[selected_index]
+        
+        # Name input
+        name_edit = QLineEdit(preset.get("name", ""))
+        form_layout.addRow("Name:", name_edit)
+        
+        # Fade in duration
+        fade_in_edit = QDoubleSpinBox()
+        fade_in_edit.setRange(0, 10)
+        fade_in_edit.setSingleStep(0.1)
+        fade_in_edit.setValue(preset.get("in", 0.5))
+        fade_in_edit.setSuffix(" sec")
+        form_layout.addRow("Fade In:", fade_in_edit)
+        
+        # Fade out duration
+        fade_out_edit = QDoubleSpinBox()
+        fade_out_edit.setRange(0, 10)
+        fade_out_edit.setSingleStep(0.1)
+        fade_out_edit.setValue(preset.get("out", 0.5))
+        fade_out_edit.setSuffix(" sec")
+        form_layout.addRow("Fade Out:", fade_out_edit)
+        
+        layout.addLayout(form_layout)
+        
+        # Dialog buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        # Show dialog
+        if dialog.exec_() == QDialog.Accepted:
+            name = name_edit.text()
+            fade_in = fade_in_edit.value()
+            fade_out = fade_out_edit.value()
+            
+            if name:
+                # Update preset
+                self.fade_presets[selected_index] = {
+                    "name": name,
+                    "in": fade_in,
+                    "out": fade_out
+                }
+                
+                # Update list item
+                preset_list.item(selected_index).setText(f"{name} (In: {fade_in}s, Out: {fade_out}s)")
+                
+                # Save to config
+                self.config_manager.set("preset_fades", self.fade_presets)
+    
+    def _remove_preset(self, preset_list):
+        """Remove a fade preset"""
+        selected_index = preset_list.currentRow()
+        
+        if selected_index == -1 or selected_index >= len(self.fade_presets):
+            return
+        
+        # Confirm deletion
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Deletion",
+            f"Are you sure you want to delete the preset '{self.fade_presets[selected_index].get('name')}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if confirm == QMessageBox.Yes:
+            # Remove preset
+            del self.fade_presets[selected_index]
+            preset_list.takeItem(selected_index)
+            
+            # Save to config
+            self.config_manager.set("preset_fades", self.fade_presets)
+    
+    def get_all_segments(self) -> List[VideoSegment]:
+        """
+        Get all segments
+        
+        Returns:
+            List[VideoSegment]: List of all segments
+        """
+        return [widget.get_segment() for widget in self.segment_widgets]

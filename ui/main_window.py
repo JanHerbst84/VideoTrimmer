@@ -6,7 +6,7 @@ from typing import List, Optional
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QFileDialog, QLabel, QAction, QMenu,
-    QMessageBox, QSplitter, QStatusBar
+    QMessageBox, QSplitter, QStatusBar, QStyle
 )
 from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QIcon
@@ -16,6 +16,7 @@ from ui.preview_panel import PreviewPanel
 from utils.config_manager import ConfigManager
 from services.video_processor import VideoProcessor
 from models.video_segment import VideoSegment
+from services.timecode_utils import seconds_to_timecode
 
 
 class MainWindow(QMainWindow):
@@ -53,14 +54,18 @@ class MainWindow(QMainWindow):
         top_bar = QHBoxLayout()
         
         self.open_button = QPushButton("Open Video")
+        self.open_button.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
         self.open_button.clicked.connect(self._open_video)
         top_bar.addWidget(self.open_button)
         
         top_bar.addStretch()
         
+        # Process button with proper declaration and styling
         self.process_button = QPushButton("Process Video")
+        self.process_button.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
         self.process_button.clicked.connect(self._process_video)
         self.process_button.setEnabled(False)
+        self.process_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 6px;")
         top_bar.addWidget(self.process_button)
         
         main_layout.addLayout(top_bar)
@@ -77,6 +82,12 @@ class MainWindow(QMainWindow):
         self.trim_panel.segment_added.connect(self._on_segment_added)
         self.trim_panel.segment_removed.connect(self._on_segment_removed)
         self.trim_panel.segment_seek_requested.connect(self._on_segment_seek)
+        
+        # Add "Add at Current Time" button to the trim panel
+        add_at_time_button = QPushButton("Add Segment at Current Time")
+        add_at_time_button.clicked.connect(self.add_segment_at_current_time)
+        self.trim_panel.layout().insertWidget(2, add_at_time_button)  # Insert after the separator
+        
         splitter.addWidget(self.trim_panel)
         
         # Set initial sizes
@@ -115,6 +126,11 @@ class MainWindow(QMainWindow):
         add_segment_action.setShortcut("Ctrl+N")
         add_segment_action.triggered.connect(self.trim_panel.add_segment)
         edit_menu.addAction(add_segment_action)
+        
+        add_at_time_action = QAction("Add Segment at Current Time", self)
+        add_at_time_action.setShortcut("Ctrl+T")
+        add_at_time_action.triggered.connect(self.add_segment_at_current_time)
+        edit_menu.addAction(add_at_time_action)
         
         edit_menu.addSeparator()
         
@@ -294,6 +310,9 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Processing video...")
             self.process_button.setEnabled(False)
             
+            # Get all segments from the trim panel
+            self.segments = self.trim_panel.get_all_segments()
+            
             # Process the video
             self.video_processor.process_segments(self.segments, output_path)
             
@@ -313,6 +332,24 @@ class MainWindow(QMainWindow):
         """Handle a new segment being added"""
         self.segments.append(segment)
         self._update_ui_state()
+    
+    def add_segment_at_current_time(self):
+        """Add a segment starting at the current preview time"""
+        if not self.video_processor:
+            return
+        
+        # Get current time from preview panel
+        current_time = self.preview_panel.current_time
+        
+        # Calculate end time (current time + 10 seconds, capped at video duration)
+        end_time = min(current_time + 10.0, self.video_processor.duration)
+        
+        # Convert to timecodes
+        start_timecode = seconds_to_timecode(current_time)
+        end_timecode = seconds_to_timecode(end_time)
+        
+        # Add the segment
+        self.trim_panel.add_segment(start_timecode, end_timecode)
     
     def _on_segment_removed(self, segment_index: int):
         """Handle a segment being removed"""
